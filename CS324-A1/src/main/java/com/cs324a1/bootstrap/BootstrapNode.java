@@ -6,7 +6,7 @@ package com.cs324a1.bootstrap;
 
 /**
  *
- * @author vishant
+ * @author Vishant - S11230430
  */
 public class BootstrapNode {
     
