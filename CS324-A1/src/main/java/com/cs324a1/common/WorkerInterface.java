@@ -4,10 +4,18 @@
  */
 package com.cs324a1.common;
 
+import java.rmi.Remote;
+import java.rmi.RemoteException;
+
 /**
  *
  * @author Vishant - S11230430
  */
-public class WorkerInterface {
+public interface WorkerInterface extends Remote {
+    int getWorkerId() throws RemoteException;
+    String getRmiAddress() throws RemoteException;
+    void addNeighbor(WorkerInterface neighbor) throws RemoteException;
+    void receiveElectionMessage(String messageId, int initiatorJAC, int initiatorId) throws RemoteException;
+    void receiveCoordinatorMessage(String messsageId, int coordinatorId, WorkerInterface coordinatorRef) throws RemoteException;
     
 }
