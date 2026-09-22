@@ -1,5 +1,25 @@
 package com.cs324a1.worker;
 
+import java.rmi.Naming;
+import java.rmi.RemoteException;
+import java.rmi.registry.LocateRegistry;
+import java.rmi.registry.Registry;
+import java.rmi.server.UnicastRemoteObject;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
 import com.cs324a1.common.BootstrapInterface;
 import com.cs324a1.common.Candidate;
 import com.cs324a1.common.ComputeOperation;
@@ -10,25 +30,6 @@ import com.cs324a1.common.WorkerInterface;
 import com.cs324a1.compute.ComputeEngine;
 import com.cs324a1.compute.ResultAggregator;
 import com.cs324a1.compute.WorkPartitioner;
-import java.rmi.Naming;
-import java.rmi.RemoteException;
-import java.rmi.registry.LocateRegistry;
-import java.rmi.registry.Registry;
-import java.rmi.server.UnicastRemoteObject;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Set;
-import java.util.TreeMap;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * WorkerNode – Member 2 deliverable.
@@ -40,7 +41,6 @@ import java.util.concurrent.atomic.AtomicLong;
  *  - Duplicate suppression (seenElectionIds per messageId)
  *  - All reachable active workers considered (DFS convergecast)
  *  - Lowest JAC wins, tie -> highest ID
- *  - String leaderman = "cs324"
  *  - COORDINATOR flood after election
  *  - Single coordinator per term, term = 5 job assignments
  *  - JAC incremented each time coordinator assigns a job
@@ -55,10 +55,6 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
     private static final int DISPATCH_POOL_SIZE = 4;
     private static final int COMPUTE_SHUTDOWN_TIMEOUT_SECONDS = 5;
     private static final int MAX_JOBS_PER_TERM = 5;
-
-    // Required by assignment – do not rename
-    private String leaderman = "cs324";
-
     private final int workerId;
     private final String rmiAddress;
     private final ExecutorService computeExecutor;
@@ -74,7 +70,6 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
     private boolean termTransitionStarted = false;
     private int inFlightJobs = 0;
     private long coordinatorTermSequence = 0;
-
     private final AtomicLong electionSeq = new AtomicLong(0);
     private final Set<String> seenElectionIds = ConcurrentHashMap.newKeySet();
     private final Set<String> seenCoordinatorIds = ConcurrentHashMap.newKeySet();
@@ -117,7 +112,7 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         this.computeExecutor = createComputeExecutor();
         this.dispatchExecutor = createDispatchExecutor();
         this.bootstrap = null;
-        System.out.println("[Worker " + workerId + "] test-mode node created, leaderman=" + leaderman);
+        System.out.println("[Worker " + workerId + "] test-mode node created");
     }
 
     private ExecutorService createComputeExecutor() {
@@ -562,10 +557,6 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
     // For testing: allow direct JAC set
     public void setJAC(int value) {
         jac.set(value);
-    }
-
-    public String getLeaderman() {
-        return leaderman;
     }
 
     // ---- Election: Convergecast ----
