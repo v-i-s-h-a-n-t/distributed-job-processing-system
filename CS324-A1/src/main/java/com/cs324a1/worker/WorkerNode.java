@@ -2,17 +2,24 @@ package com.cs324a1.worker;
 
 import com.cs324a1.common.BootstrapInterface;
 import com.cs324a1.common.Candidate;
+import com.cs324a1.common.ComputeOperation;
+import com.cs324a1.common.JobRequest;
 import com.cs324a1.common.WorkResult;
 import com.cs324a1.common.WorkUnit;
 import com.cs324a1.common.WorkerInterface;
 import com.cs324a1.compute.ComputeEngine;
+import com.cs324a1.compute.ResultAggregator;
+import com.cs324a1.compute.WorkPartitioner;
+import java.rmi.Naming;
 import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
@@ -46,6 +53,7 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
 
     private static final long serialVersionUID = 1L;
     private static final int COMPUTE_POOL_SIZE = 4;
+    private static final int DISPATCH_POOL_SIZE = 4;
     private static final int COMPUTE_SHUTDOWN_TIMEOUT_SECONDS = 5;
 
     // Required by assignment – do not rename
@@ -54,6 +62,7 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
     private final int workerId;
     private final String rmiAddress;
     private final ExecutorService computeExecutor;
+    private final ExecutorService dispatchExecutor;
     private final CopyOnWriteArrayList<WorkerInterface> neighbors = new CopyOnWriteArrayList<>();
     private final AtomicInteger jac = new AtomicInteger(0);
     private final AtomicInteger jobsInCurrentTerm = new AtomicInteger(0);
@@ -80,6 +89,7 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         this.workerId = workerId;
         this.rmiAddress = "//" + bootstrapHost + ":" + bootstrapPort + "/Worker-" + workerId;
         this.computeExecutor = createComputeExecutor();
+        this.dispatchExecutor = createDispatchExecutor();
         initRmiAndBootstrap(bootstrapHost, bootstrapPort);
         registerShutdownHook();
     }
@@ -100,6 +110,7 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         this.workerId = workerId;
         this.rmiAddress = "test://Worker-" + workerId;
         this.computeExecutor = createComputeExecutor();
+        this.dispatchExecutor = createDispatchExecutor();
         this.bootstrap = null;
         System.out.println("[Worker " + workerId + "] test-mode node created, leaderman=" + leaderman);
     }
@@ -107,6 +118,14 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
     private ExecutorService createComputeExecutor() {
         return Executors.newFixedThreadPool(COMPUTE_POOL_SIZE, task -> {
             Thread thread = new Thread(task, "worker-" + workerId + "-compute");
+            thread.setDaemon(false);
+            return thread;
+        });
+    }
+
+    private ExecutorService createDispatchExecutor() {
+        return Executors.newFixedThreadPool(DISPATCH_POOL_SIZE, task -> {
+            Thread thread = new Thread(task, "worker-" + workerId + "-dispatch");
             thread.setDaemon(false);
             return thread;
         });
@@ -168,7 +187,7 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
             } catch (Exception ignored) {
                 // best-effort deregistration
             } finally {
-                shutdownComputeExecutor();
+                shutdownWorkerExecutors();
             }
         }, "worker-" + workerId + "-shutdown"));
     }
@@ -250,21 +269,169 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
                 workUnit.jobId(), workUnit.partitionId(), workUnit.operation(), value);
     }
 
-    void shutdownComputeExecutor() {
-        computeExecutor.shutdown();
+    // ---- WorkerInterface : coordinator-side job submission ----
+
+    @Override
+    public long submitJob(JobRequest request) throws RemoteException {
+        if (request == null) {
+            throw new RemoteException("request must not be null");
+        }
+
+        if (!isCoordinator) {
+            return forwardJobToCoordinator(request);
+        }
+        return executeDistributedJob(request);
+    }
+
+    private long forwardJobToCoordinator(JobRequest request) throws RemoteException {
+        WorkerInterface target = coordinatorRef;
+        if (target == null) {
+            throw new RemoteException("Worker " + workerId + " has no known coordinator");
+        }
+
         try {
-            if (!computeExecutor.awaitTermination(
-                    COMPUTE_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                computeExecutor.shutdownNow();
+            int targetId = target.getWorkerId();
+            if (targetId == workerId || !target.isCoordinator()) {
+                throw new RemoteException("Known coordinator reference is not currently valid");
+            }
+            return target.submitJob(request);
+        } catch (RemoteException e) {
+            throw new RemoteException("Unable to forward job to coordinator", e);
+        }
+    }
+
+    private long executeDistributedJob(JobRequest request) throws RemoteException {
+        // Existing Member 2 accounting defines one assignment as one complete job,
+        // not one distributed partition.
+        recordJobAssignment();
+
+        if (request.operation() == ComputeOperation.PRIMECOUNT
+                && request.numbers().isEmpty()) {
+            return 0L;
+        }
+
+        List<WorkerInterface> workers = usableWorkersInIdOrder();
+        if (workers.isEmpty()) {
+            throw new RemoteException("No active workers are available for job " + request.jobId());
+        }
+
+        List<WorkUnit> workUnits = WorkPartitioner.partition(request, workers.size());
+        List<Future<WorkResult>> futures = new ArrayList<>(workUnits.size());
+
+        try {
+            for (int index = 0; index < workUnits.size(); index++) {
+                WorkerInterface worker = workers.get(index);
+                WorkUnit workUnit = workUnits.get(index);
+                futures.add(dispatchExecutor.submit(() -> worker.executeWorkUnit(workUnit)));
+            }
+        } catch (RejectedExecutionException e) {
+            cancelDispatches(futures);
+            throw new RemoteException("Coordinator is not accepting dispatch tasks", e);
+        }
+
+        List<WorkResult> results = new ArrayList<>(workUnits.size());
+        try {
+            for (Future<WorkResult> future : futures) {
+                results.add(future.get());
             }
         } catch (InterruptedException e) {
-            computeExecutor.shutdownNow();
+            cancelDispatches(futures);
+            Thread.currentThread().interrupt();
+            throw new RemoteException("Interrupted while collecting distributed results", e);
+        } catch (ExecutionException e) {
+            cancelDispatches(futures);
+            throw new RemoteException("A required work-unit partition failed", e.getCause());
+        }
+
+        try {
+            return ResultAggregator.aggregate(request, workUnits, results);
+        } catch (IllegalArgumentException | ArithmeticException e) {
+            throw new RemoteException("Distributed result aggregation failed", e);
+        }
+    }
+
+    private List<WorkerInterface> usableWorkersInIdOrder() throws RemoteException {
+        List<WorkerInterface> discovered = discoverActiveWorkers();
+        if (discovered == null) {
+            throw new RemoteException("Active-worker discovery returned no snapshot");
+        }
+
+        TreeMap<Integer, WorkerInterface> workersById = new TreeMap<>();
+        for (WorkerInterface worker : discovered) {
+            if (worker == null) {
+                continue;
+            }
+            try {
+                workersById.putIfAbsent(worker.getWorkerId(), worker);
+            } catch (RemoteException e) {
+                System.err.println("[Coordinator " + workerId
+                        + "] skipping unreachable worker: " + e.getMessage());
+            }
+        }
+        return List.copyOf(workersById.values());
+    }
+
+    /**
+     * Resolves the Bootstrap membership snapshot. Protected visibility permits
+     * deterministic test-mode membership without creating a second production
+     * membership mechanism.
+     */
+    protected List<WorkerInterface> discoverActiveWorkers() throws RemoteException {
+        if (bootstrap == null) {
+            throw new RemoteException("Bootstrap membership is unavailable");
+        }
+
+        List<String> activeAddresses = bootstrap.getActiveWorkers();
+        List<WorkerInterface> resolved = new ArrayList<>(activeAddresses.size());
+        for (String address : activeAddresses) {
+            if (rmiAddress.equals(address)) {
+                resolved.add(this);
+                continue;
+            }
+            try {
+                resolved.add((WorkerInterface) Naming.lookup(address));
+            } catch (Exception e) {
+                System.err.println("[Coordinator " + workerId + "] could not resolve "
+                        + address + ": " + e.getMessage());
+            }
+        }
+        return resolved;
+    }
+
+    private static void cancelDispatches(List<Future<WorkResult>> futures) {
+        for (Future<WorkResult> future : futures) {
+            future.cancel(true);
+        }
+    }
+
+    void shutdownComputeExecutor() {
+        shutdownExecutor(computeExecutor);
+    }
+
+    void shutdownWorkerExecutors() {
+        shutdownExecutor(dispatchExecutor);
+        shutdownComputeExecutor();
+    }
+
+    private static void shutdownExecutor(ExecutorService executor) {
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(
+                    COMPUTE_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
             Thread.currentThread().interrupt();
         }
     }
 
     boolean isComputeExecutorShutdown() {
         return computeExecutor.isShutdown();
+    }
+
+    boolean isDispatchExecutorShutdown() {
+        return dispatchExecutor.isShutdown();
     }
 
     @Override

@@ -18,6 +18,7 @@ public interface WorkerInterface extends Remote {
 
     // --- Member 3: Worker-side computation ---
     WorkResult executeWorkUnit(WorkUnit workUnit) throws RemoteException;
+    long submitJob(JobRequest request) throws RemoteException;
 
     // --- Legacy signatures (Member 1) kept for backward compatibility ---
     void receiveElectionMessage(String messageId, int initiatorJAC, int initiatorId) throws RemoteException;
