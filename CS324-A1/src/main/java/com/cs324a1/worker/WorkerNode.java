@@ -16,7 +16,6 @@ import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeMap;
@@ -242,6 +241,9 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
             throw new RemoteException("workUnit must not be null");
         }
 
+        System.out.println("[Worker " + workerId + "] executing job " + workUnit.jobId()
+                + " partition " + workUnit.partitionId() + " " + describeWorkUnit(workUnit));
+
         Future<WorkResult> future;
         try {
             future = computeExecutor.submit(() -> computeWorkUnit(workUnit));
@@ -251,7 +253,10 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         }
 
         try {
-            return future.get();
+            WorkResult result = future.get();
+            System.out.println("[Worker " + workerId + "] finished job " + workUnit.jobId()
+                    + " partition " + workUnit.partitionId() + " = " + result.value());
+            return result;
         } catch (InterruptedException e) {
             future.cancel(true);
             Thread.currentThread().interrupt();
@@ -259,6 +264,14 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         } catch (ExecutionException e) {
             throw new RemoteException("Work-unit computation failed", e.getCause());
         }
+    }
+
+    private static String describeWorkUnit(WorkUnit workUnit) {
+        return switch (workUnit.operation()) {
+            case MAX -> "MAX" + workUnit.numbers();
+            case PRIMECOUNT -> "PRIMECOUNT" + workUnit.numbers();
+            case PRIMESUM -> "PRIMESUM(" + workUnit.start() + "," + workUnit.end() + ")";
+        };
     }
 
     /**
@@ -292,7 +305,12 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
     private long forwardJobToCoordinator(JobRequest request) throws RemoteException {
         WorkerInterface target = coordinatorRef;
         if (target == null) {
-            throw new RemoteException("Worker " + workerId + " has no known coordinator");
+            // No coordinator active: any worker may initiate an election (automated).
+            initiateElection();
+            target = coordinatorRef;
+            if (target == null) {
+                throw new RemoteException("Worker " + workerId + " has no known coordinator");
+            }
         }
 
         try {
@@ -326,6 +344,15 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
                 for (int index = 0; index < workUnits.size(); index++) {
                     WorkerInterface worker = workers.get(index);
                     WorkUnit workUnit = workUnits.get(index);
+                    int targetId;
+                    try {
+                        targetId = worker.getWorkerId();
+                    } catch (RemoteException e) {
+                        targetId = -1;
+                    }
+                    System.out.println("[Coordinator " + workerId + "] assigning job " + request.jobId()
+                            + " partition " + workUnit.partitionId() + "/" + workUnits.size()
+                            + " " + describeWorkUnit(workUnit) + " -> worker " + targetId);
                     futures.add(dispatchExecutor.submit(() -> worker.executeWorkUnit(workUnit)));
                 }
             } catch (RejectedExecutionException e) {
@@ -656,20 +683,10 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
             }
 
             int electedId = best.workerId;
-            // Preferred: use stub carried in Candidate (avoids registry lookup); fallback to search
+            // Stub is carried in Candidate during convergecast, so no lookup is needed.
             WorkerInterface electedRef = best.stub;
-            if (electedRef == null) {
-                if (electedId == workerId) {
-                    electedRef = this;
-                } else {
-                    electedRef = findWorkerRef(electedId, new HashSet<>());
-                    if (electedRef == null) {
-                        electedRef = lookupViaRegistry(electedId);
-                    }
-                    if (electedRef == null) {
-                        System.err.println("[Worker " + workerId + "] WARNING: could not locate stub for elected " + electedId + ", using null");
-                    }
-                }
+            if (electedRef == null && electedId == workerId) {
+                electedRef = this;
             }
 
             System.out.println("[Worker " + workerId + "] election result: winner=" + best + " (JAC=" + best.jac + ")");
@@ -712,11 +729,6 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
     // ---- JAC & Term limits (5 jobs per term) ----
 
     @Override
-    public void incrementJAC() throws RemoteException {
-        recordJobAssignment();
-    }
-
-    @Override
     public int recordJobAssignment() throws RemoteException {
         JobAdmission admission = admitTopLevelJob();
         try {
@@ -724,81 +736,6 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         } finally {
             completeTopLevelJob(admission);
         }
-    }
-
-    /**
-     * Helper for Member 3 job distributor: increment without throwing if not coordinator.
-     * Returns new JAC or -1 if not coordinator.
-     */
-    public int tryRecordJob() {
-        try {
-            return recordJobAssignment();
-        } catch (RemoteException e) {
-            System.err.println("[Worker " + workerId + "] tryRecordJob failed: " + e.getMessage());
-            return -1;
-        }
-    }
-
-    // ---- Legacy compatibility delegates ----
-
-    @Override
-    public void receiveElectionMessage(String messageId, int initiatorJAC, int initiatorId) throws RemoteException {
-        // Legacy entry – adapt to new convergecast.
-        // To avoid double-counting, synthesize a candidate from initiator fields
-        // but the full election still floods via propagateElection which collects real JACs.
-        System.out.println("[Worker " + workerId + "] receiveElectionMessage legacy: " + messageId + " initiator=" + initiatorId + " JAC=" + initiatorJAC);
-        // If we have not seen this message, run the new path
-        // We treat messageId as electionId and run propagation; ignore return since caller expects void
-        propagateElection(messageId, null);
-    }
-
-    @Override
-    public void receiveCoordinatorMessage(String messageId, int coordinatorId, WorkerInterface coordinatorRef) throws RemoteException {
-        System.out.println("[Worker " + workerId + "] receiveCoordinatorMessage legacy: " + messageId + " coordinator=" + coordinatorId);
-        propagateCoordinator(messageId, coordinatorId, coordinatorRef, null);
-    }
-
-    // ---- Helpers ----
-
-    private WorkerInterface findWorkerRef(int targetId, Set<Integer> visited) throws RemoteException {
-        if (visited.contains(workerId)) return null;
-        visited.add(workerId);
-        if (workerId == targetId) return this;
-        for (WorkerInterface n : neighbors) {
-            if (n == null) continue;
-            try {
-                int nid = n.getWorkerId();
-                if (nid == targetId) return n;
-                if (visited.contains(nid)) continue;
-                // Recurse through RMI – ask neighbor to search its subtree
-                // We invoke a helper via reflection-like search: call findWorkerRef on remote if it is WorkerNode stub
-                // Since remote type is WorkerInterface without find method, we fallback to DFS via calling getNeighbors on remote?
-                // Instead we do iterative BFS via local knowledge: neighbors are stubs, we can call a custom internal method if remote is WorkerNode
-                // For simplicity, if remote is WorkerNode we can cast? In RMI, stub class is proxy, so we try to look up via registry second pass.
-                // Practical fallback: just check immediate neighbors; deeper search not needed for test graphs where winner is 1-hop away.
-                // For deeper, we ask neighbor to do propagate-style search – reuse propagateElection search pattern.
-                // We'll call a lightweight remote method: we already have getWorkerId; we can recursively call find via RMI by using a helper interface?
-                // Simpler: use RMI registry lookup for targetId if bootstrap known – will succeed for production.
-            } catch (RemoteException e) {
-                continue;
-            }
-        }
-        // Not found in immediate neighbors – try registry
-        return null;
-    }
-
-    private WorkerInterface lookupViaRegistry(int targetId) {
-        try {
-            Registry reg = LocateRegistry.getRegistry("localhost", 1099);
-            return (WorkerInterface) reg.lookup("Worker-" + targetId);
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    private WorkerInterface lookupViaBootstrap(int targetId) {
-        // Bootstrap stores addresses – not ids directly; we try registry fallback above
-        return lookupViaRegistry(targetId);
     }
 
     // ---- Main – run as separate process ----
@@ -813,33 +750,21 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         int port = args.length > 2 ? Integer.parseInt(args[2]) : 1099;
         try {
             WorkerNode node = new WorkerNode(id, host, port);
-            System.out.println("[Worker " + id + "] ready. Commands: elect | jac | info | quit");
-            // Simple console loop for manual election trigger
-            java.util.Scanner sc = new java.util.Scanner(System.in);
-            while (sc.hasNextLine()) {
-                String line = sc.nextLine().trim().toLowerCase();
-                switch (line) {
-                    case "elect":
-                        try { node.initiateElection(); } catch (Exception e) { e.printStackTrace(); }
-                        break;
-                    case "jac":
-                        System.out.println("JAC=" + node.jac.get() + " term=" + node.jobsInCurrentTerm.get() + " coordinator=" + node.coordinatorId + " isCoord=" + node.isCoordinator);
-                        break;
-                    case "info":
-                        System.out.println("Worker " + node.workerId + " neighbors=" + node.neighbors.size() + " leaderman=" + node.leaderman);
-                        for (WorkerInterface n : node.neighbors) {
-                            try { System.out.println("  - neighbor " + n.getWorkerId() + " JAC=" + n.getJAC()); } catch (Exception e) { System.out.println("  - neighbor unreachable"); }
-                        }
-                        break;
-                    case "quit":
-                    case "exit":
-                        System.exit(0);
-                        break;
-                    default:
-                        if (!line.isEmpty()) System.out.println("unknown command: " + line);
+            System.out.println("[Worker " + id + "] ready. JAC=" + node.jac.get());
+            // Automated election: if no coordinator is active, this worker initiates one.
+            // Delayed so neighbours have time to join the unstructured network.
+            Thread electionTrigger = new Thread(() -> {
+                try {
+                    Thread.sleep(2000);
+                    node.initiateElection();
+                } catch (Exception e) {
+                    System.err.println("[Worker " + id + "] automatic election failed: " + e.getMessage());
                 }
-            }
-            sc.close();
+            }, "worker-" + id + "-auto-elect");
+            electionTrigger.setDaemon(true);
+            electionTrigger.start();
+            // Stay alive for RMI callbacks without requiring terminal input.
+            Thread.currentThread().join();
         } catch (Exception e) {
             e.printStackTrace();
             System.exit(1);

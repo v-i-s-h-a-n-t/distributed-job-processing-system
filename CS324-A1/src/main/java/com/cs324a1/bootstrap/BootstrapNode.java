@@ -4,7 +4,6 @@
  */
 package com.cs324a1.bootstrap;
 
-import java.rmi.Naming;
 import java.rmi.NotBoundException;
 import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
@@ -12,15 +11,10 @@ import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.TimeUnit;
 
 import com.cs324a1.common.BootstrapInterface;
-import com.cs324a1.common.WorkerInterface;
 
 /**
  *
@@ -28,24 +22,11 @@ import com.cs324a1.common.WorkerInterface;
  */
 public class BootstrapNode extends UnicastRemoteObject implements BootstrapInterface {
 
-    private static final int HEALTH_CHECK_INTERVAL_SECONDS = 15;
-
     private final ConcurrentHashMap<Integer, String> activeWorkers;
-    private final ScheduledExecutorService healthChecker;
 
     public BootstrapNode() throws RemoteException {
         super();
         this.activeWorkers = new ConcurrentHashMap<>();
-        this.healthChecker = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "bootstrap-health-check");
-            t.setDaemon(true);
-            return t;
-        });
-        this.healthChecker.scheduleWithFixedDelay(
-                this::pruneDeadWorkers,
-                HEALTH_CHECK_INTERVAL_SECONDS,
-                HEALTH_CHECK_INTERVAL_SECONDS,
-                TimeUnit.SECONDS);
     }
 
     @Override
@@ -83,34 +64,12 @@ public class BootstrapNode extends UnicastRemoteObject implements BootstrapInter
         return new ArrayList<>(activeWorkers.values());
     }
 
-    /**
-     * Periodically pings every registered worker and removes any that no
-     * longer respond, so dead addresses stop being handed out as
-     * neighbor candidates to newly joining workers.
-     */
-    private void pruneDeadWorkers() {
-        for (Map.Entry<Integer, String> entry : activeWorkers.entrySet()) {
-            int workerId = entry.getKey();
-            String rmiAddress = entry.getValue();
-            try {
-                WorkerInterface stub = (WorkerInterface) Naming.lookup(rmiAddress);
-                stub.getWorkerId();
-            } catch (RemoteException | NotBoundException | java.net.MalformedURLException e) {
-                if (activeWorkers.remove(workerId, rmiAddress)) {
-                    System.out.printf("Bootstrap Worker %d at %s failed health check, removing.%n",
-                            workerId, rmiAddress);
-                }
-            }
-        }
-    }
-
     private void shutdown(Registry registry) {
         try {
             registry.unbind("BootstrapNode");
         } catch (RemoteException | NotBoundException e) {
             // best-effort on shutdown
         }
-        healthChecker.shutdownNow();
     }
 
     public static void main(String[] args) {

@@ -20,10 +20,6 @@ public interface WorkerInterface extends Remote {
     WorkResult executeWorkUnit(WorkUnit workUnit) throws RemoteException;
     long submitJob(JobRequest request) throws RemoteException;
 
-    // --- Legacy signatures (Member 1) kept for backward compatibility ---
-    void receiveElectionMessage(String messageId, int initiatorJAC, int initiatorId) throws RemoteException;
-    void receiveCoordinatorMessage(String messsageId, int coordinatorId, WorkerInterface coordinatorRef) throws RemoteException;
-
     // --- Member 2: Leader Election Extensions ---
     int getJAC() throws RemoteException;
     int getCoordinatorId() throws RemoteException;
@@ -50,7 +46,6 @@ public interface WorkerInterface extends Remote {
     void initiateElection() throws RemoteException;
 
     // JAC / Term management (Member 2 - term limit 5 jobs)
-    void incrementJAC() throws RemoteException;
     int recordJobAssignment() throws RemoteException; // increments JAC + term count, triggers re-election if term >=5
     int getJobsInCurrentTerm() throws RemoteException;
 }
