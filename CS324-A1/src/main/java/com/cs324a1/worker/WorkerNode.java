@@ -70,6 +70,7 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
     private boolean termTransitionStarted = false;
     private int inFlightJobs = 0;
     private long coordinatorTermSequence = 0;
+
     private final AtomicLong electionSeq = new AtomicLong(0);
     private final Set<String> seenElectionIds = ConcurrentHashMap.newKeySet();
     private final Set<String> seenCoordinatorIds = ConcurrentHashMap.newKeySet();
