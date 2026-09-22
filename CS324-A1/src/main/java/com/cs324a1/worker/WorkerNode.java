@@ -2,7 +2,10 @@ package com.cs324a1.worker;
 
 import com.cs324a1.common.BootstrapInterface;
 import com.cs324a1.common.Candidate;
+import com.cs324a1.common.WorkResult;
+import com.cs324a1.common.WorkUnit;
 import com.cs324a1.common.WorkerInterface;
+import com.cs324a1.compute.ComputeEngine;
 import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
@@ -12,6 +15,12 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -36,12 +45,15 @@ import java.util.concurrent.atomic.AtomicLong;
 public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
 
     private static final long serialVersionUID = 1L;
+    private static final int COMPUTE_POOL_SIZE = 4;
+    private static final int COMPUTE_SHUTDOWN_TIMEOUT_SECONDS = 5;
 
     // Required by assignment – do not rename
     private String leaderman = "cs324";
 
     private final int workerId;
     private final String rmiAddress;
+    private final ExecutorService computeExecutor;
     private final CopyOnWriteArrayList<WorkerInterface> neighbors = new CopyOnWriteArrayList<>();
     private final AtomicInteger jac = new AtomicInteger(0);
     private final AtomicInteger jobsInCurrentTerm = new AtomicInteger(0);
@@ -67,7 +79,9 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         super();
         this.workerId = workerId;
         this.rmiAddress = "//" + bootstrapHost + ":" + bootstrapPort + "/Worker-" + workerId;
+        this.computeExecutor = createComputeExecutor();
         initRmiAndBootstrap(bootstrapHost, bootstrapPort);
+        registerShutdownHook();
     }
 
     /**
@@ -85,8 +99,17 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         super();
         this.workerId = workerId;
         this.rmiAddress = "test://Worker-" + workerId;
+        this.computeExecutor = createComputeExecutor();
         this.bootstrap = null;
         System.out.println("[Worker " + workerId + "] test-mode node created, leaderman=" + leaderman);
+    }
+
+    private ExecutorService createComputeExecutor() {
+        return Executors.newFixedThreadPool(COMPUTE_POOL_SIZE, task -> {
+            Thread thread = new Thread(task, "worker-" + workerId + "-compute");
+            thread.setDaemon(false);
+            return thread;
+        });
     }
 
     private void initRmiAndBootstrap(String host, int port) {
@@ -129,20 +152,25 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
                 this.bootstrap = null;
             }
 
-            // Shutdown hook to deregister
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                try {
-                    if (bootstrap != null) {
-                        bootstrap.deregisterWorker(workerId);
-                        System.out.println("[Worker " + workerId + "] deregistered on shutdown");
-                    }
-                } catch (Exception ignored) {}
-            }));
-
         } catch (Exception e) {
             System.err.println("[Worker " + workerId + "] RMI init failure: " + e.getMessage());
             e.printStackTrace();
         }
+    }
+
+    private void registerShutdownHook() {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                if (bootstrap != null) {
+                    bootstrap.deregisterWorker(workerId);
+                    System.out.println("[Worker " + workerId + "] deregistered on shutdown");
+                }
+            } catch (Exception ignored) {
+                // best-effort deregistration
+            } finally {
+                shutdownComputeExecutor();
+            }
+        }, "worker-" + workerId + "-shutdown"));
     }
 
     // ---- WorkerInterface : basic ----
@@ -179,6 +207,64 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
     // Expose neighbor list for debugging – not in original spec but useful
     public List<WorkerInterface> getNeighborsList() {
         return neighbors;
+    }
+
+    // ---- WorkerInterface : computation ----
+
+    @Override
+    public WorkResult executeWorkUnit(WorkUnit workUnit) throws RemoteException {
+        if (workUnit == null) {
+            throw new RemoteException("workUnit must not be null");
+        }
+
+        Future<WorkResult> future;
+        try {
+            future = computeExecutor.submit(() -> computeWorkUnit(workUnit));
+        } catch (RejectedExecutionException e) {
+            throw new RemoteException("Worker " + workerId
+                    + " is not accepting computation tasks", e);
+        }
+
+        try {
+            return future.get();
+        } catch (InterruptedException e) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new RemoteException("Interrupted while waiting for work-unit result", e);
+        } catch (ExecutionException e) {
+            throw new RemoteException("Work-unit computation failed", e.getCause());
+        }
+    }
+
+    /**
+     * Runs on a compute-pool thread. Protected visibility provides a small test
+     * seam without exposing computation details through the remote interface.
+     */
+    protected WorkResult computeWorkUnit(WorkUnit workUnit) {
+        long value = switch (workUnit.operation()) {
+            case MAX -> ComputeEngine.max(workUnit.numbers());
+            case PRIMESUM -> ComputeEngine.primeSum(workUnit.start(), workUnit.end());
+            case PRIMECOUNT -> ComputeEngine.primeCount(workUnit.numbers());
+        };
+        return new WorkResult(
+                workUnit.jobId(), workUnit.partitionId(), workUnit.operation(), value);
+    }
+
+    void shutdownComputeExecutor() {
+        computeExecutor.shutdown();
+        try {
+            if (!computeExecutor.awaitTermination(
+                    COMPUTE_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                computeExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            computeExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    boolean isComputeExecutorShutdown() {
+        return computeExecutor.isShutdown();
     }
 
     @Override

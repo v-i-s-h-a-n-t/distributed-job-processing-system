@@ -16,6 +16,9 @@ public interface WorkerInterface extends Remote {
     String getRmiAddress() throws RemoteException;
     void addNeighbor(WorkerInterface neighbor) throws RemoteException;
 
+    // --- Member 3: Worker-side computation ---
+    WorkResult executeWorkUnit(WorkUnit workUnit) throws RemoteException;
+
     // --- Legacy signatures (Member 1) kept for backward compatibility ---
     void receiveElectionMessage(String messageId, int initiatorJAC, int initiatorId) throws RemoteException;
     void receiveCoordinatorMessage(String messsageId, int coordinatorId, WorkerInterface coordinatorRef) throws RemoteException;
