@@ -2,16 +2,32 @@ package com.cs324a1.worker;
 
 import com.cs324a1.common.BootstrapInterface;
 import com.cs324a1.common.Candidate;
+import com.cs324a1.common.ComputeOperation;
+import com.cs324a1.common.JobRequest;
+import com.cs324a1.common.WorkResult;
+import com.cs324a1.common.WorkUnit;
 import com.cs324a1.common.WorkerInterface;
+import com.cs324a1.compute.ComputeEngine;
+import com.cs324a1.compute.ResultAggregator;
+import com.cs324a1.compute.WorkPartitioner;
+import java.rmi.Naming;
 import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -36,18 +52,29 @@ import java.util.concurrent.atomic.AtomicLong;
 public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
 
     private static final long serialVersionUID = 1L;
+    private static final int COMPUTE_POOL_SIZE = 4;
+    private static final int DISPATCH_POOL_SIZE = 4;
+    private static final int COMPUTE_SHUTDOWN_TIMEOUT_SECONDS = 5;
+    private static final int MAX_JOBS_PER_TERM = 5;
 
     // Required by assignment – do not rename
     private String leaderman = "cs324";
 
     private final int workerId;
     private final String rmiAddress;
+    private final ExecutorService computeExecutor;
+    private final ExecutorService dispatchExecutor;
     private final CopyOnWriteArrayList<WorkerInterface> neighbors = new CopyOnWriteArrayList<>();
     private final AtomicInteger jac = new AtomicInteger(0);
     private final AtomicInteger jobsInCurrentTerm = new AtomicInteger(0);
     private volatile boolean isCoordinator = false;
     private volatile int coordinatorId = -1;
     private volatile WorkerInterface coordinatorRef = null;
+    private final Object termStateLock = new Object();
+    private boolean termClosing = false;
+    private boolean termTransitionStarted = false;
+    private int inFlightJobs = 0;
+    private long coordinatorTermSequence = 0;
 
     private final AtomicLong electionSeq = new AtomicLong(0);
     private final Set<String> seenElectionIds = ConcurrentHashMap.newKeySet();
@@ -67,7 +94,10 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         super();
         this.workerId = workerId;
         this.rmiAddress = "//" + bootstrapHost + ":" + bootstrapPort + "/Worker-" + workerId;
+        this.computeExecutor = createComputeExecutor();
+        this.dispatchExecutor = createDispatchExecutor();
         initRmiAndBootstrap(bootstrapHost, bootstrapPort);
+        registerShutdownHook();
     }
 
     /**
@@ -85,8 +115,26 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         super();
         this.workerId = workerId;
         this.rmiAddress = "test://Worker-" + workerId;
+        this.computeExecutor = createComputeExecutor();
+        this.dispatchExecutor = createDispatchExecutor();
         this.bootstrap = null;
         System.out.println("[Worker " + workerId + "] test-mode node created, leaderman=" + leaderman);
+    }
+
+    private ExecutorService createComputeExecutor() {
+        return Executors.newFixedThreadPool(COMPUTE_POOL_SIZE, task -> {
+            Thread thread = new Thread(task, "worker-" + workerId + "-compute");
+            thread.setDaemon(false);
+            return thread;
+        });
+    }
+
+    private ExecutorService createDispatchExecutor() {
+        return Executors.newFixedThreadPool(DISPATCH_POOL_SIZE, task -> {
+            Thread thread = new Thread(task, "worker-" + workerId + "-dispatch");
+            thread.setDaemon(false);
+            return thread;
+        });
     }
 
     private void initRmiAndBootstrap(String host, int port) {
@@ -129,20 +177,25 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
                 this.bootstrap = null;
             }
 
-            // Shutdown hook to deregister
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                try {
-                    if (bootstrap != null) {
-                        bootstrap.deregisterWorker(workerId);
-                        System.out.println("[Worker " + workerId + "] deregistered on shutdown");
-                    }
-                } catch (Exception ignored) {}
-            }));
-
         } catch (Exception e) {
             System.err.println("[Worker " + workerId + "] RMI init failure: " + e.getMessage());
             e.printStackTrace();
         }
+    }
+
+    private void registerShutdownHook() {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                if (bootstrap != null) {
+                    bootstrap.deregisterWorker(workerId);
+                    System.out.println("[Worker " + workerId + "] deregistered on shutdown");
+                }
+            } catch (Exception ignored) {
+                // best-effort deregistration
+            } finally {
+                shutdownWorkerExecutors();
+            }
+        }, "worker-" + workerId + "-shutdown"));
     }
 
     // ---- WorkerInterface : basic ----
@@ -179,6 +232,279 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
     // Expose neighbor list for debugging – not in original spec but useful
     public List<WorkerInterface> getNeighborsList() {
         return neighbors;
+    }
+
+    // ---- WorkerInterface : computation ----
+
+    @Override
+    public WorkResult executeWorkUnit(WorkUnit workUnit) throws RemoteException {
+        if (workUnit == null) {
+            throw new RemoteException("workUnit must not be null");
+        }
+
+        Future<WorkResult> future;
+        try {
+            future = computeExecutor.submit(() -> computeWorkUnit(workUnit));
+        } catch (RejectedExecutionException e) {
+            throw new RemoteException("Worker " + workerId
+                    + " is not accepting computation tasks", e);
+        }
+
+        try {
+            return future.get();
+        } catch (InterruptedException e) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new RemoteException("Interrupted while waiting for work-unit result", e);
+        } catch (ExecutionException e) {
+            throw new RemoteException("Work-unit computation failed", e.getCause());
+        }
+    }
+
+    /**
+     * Runs on a compute-pool thread. Protected visibility provides a small test
+     * seam without exposing computation details through the remote interface.
+     */
+    protected WorkResult computeWorkUnit(WorkUnit workUnit) {
+        long value = switch (workUnit.operation()) {
+            case MAX -> ComputeEngine.max(workUnit.numbers());
+            case PRIMESUM -> ComputeEngine.primeSum(workUnit.start(), workUnit.end());
+            case PRIMECOUNT -> ComputeEngine.primeCount(workUnit.numbers());
+        };
+        return new WorkResult(
+                workUnit.jobId(), workUnit.partitionId(), workUnit.operation(), value);
+    }
+
+    // ---- WorkerInterface : coordinator-side job submission ----
+
+    @Override
+    public long submitJob(JobRequest request) throws RemoteException {
+        if (request == null) {
+            throw new RemoteException("request must not be null");
+        }
+
+        if (!isCoordinator) {
+            return forwardJobToCoordinator(request);
+        }
+        return executeDistributedJob(request);
+    }
+
+    private long forwardJobToCoordinator(JobRequest request) throws RemoteException {
+        WorkerInterface target = coordinatorRef;
+        if (target == null) {
+            throw new RemoteException("Worker " + workerId + " has no known coordinator");
+        }
+
+        try {
+            int targetId = target.getWorkerId();
+            if (targetId == workerId || !target.isCoordinator()) {
+                throw new RemoteException("Known coordinator reference is not currently valid");
+            }
+            return target.submitJob(request);
+        } catch (RemoteException e) {
+            throw new RemoteException("Unable to forward job to coordinator", e);
+        }
+    }
+
+    private long executeDistributedJob(JobRequest request) throws RemoteException {
+        JobAdmission admission = admitTopLevelJob();
+        try {
+            if (request.operation() == ComputeOperation.PRIMECOUNT
+                    && request.numbers().isEmpty()) {
+                return 0L;
+            }
+
+            List<WorkerInterface> workers = usableWorkersInIdOrder();
+            if (workers.isEmpty()) {
+                throw new RemoteException("No active workers are available for job " + request.jobId());
+            }
+
+            List<WorkUnit> workUnits = WorkPartitioner.partition(request, workers.size());
+            List<Future<WorkResult>> futures = new ArrayList<>(workUnits.size());
+
+            try {
+                for (int index = 0; index < workUnits.size(); index++) {
+                    WorkerInterface worker = workers.get(index);
+                    WorkUnit workUnit = workUnits.get(index);
+                    futures.add(dispatchExecutor.submit(() -> worker.executeWorkUnit(workUnit)));
+                }
+            } catch (RejectedExecutionException e) {
+                cancelDispatches(futures);
+                throw new RemoteException("Coordinator is not accepting dispatch tasks", e);
+            }
+
+            List<WorkResult> results = new ArrayList<>(workUnits.size());
+            try {
+                for (Future<WorkResult> future : futures) {
+                    results.add(future.get());
+                }
+            } catch (InterruptedException e) {
+                cancelDispatches(futures);
+                Thread.currentThread().interrupt();
+                throw new RemoteException("Interrupted while collecting distributed results", e);
+            } catch (ExecutionException e) {
+                cancelDispatches(futures);
+                throw new RemoteException("A required work-unit partition failed", e.getCause());
+            }
+
+            try {
+                return ResultAggregator.aggregate(request, workUnits, results);
+            } catch (IllegalArgumentException | ArithmeticException e) {
+                throw new RemoteException("Distributed result aggregation failed", e);
+            }
+        } finally {
+            completeTopLevelJob(admission);
+        }
+    }
+
+    private JobAdmission admitTopLevelJob() throws RemoteException {
+        JobAdmission admission;
+        synchronized (termStateLock) {
+            if (!isCoordinator) {
+                throw new RemoteException("Worker " + workerId
+                        + " is not coordinator - cannot assign jobs");
+            }
+            if (termClosing || jobsInCurrentTerm.get() >= MAX_JOBS_PER_TERM) {
+                throw new RemoteException("Coordinator term is transitioning; try the new coordinator");
+            }
+
+            int newJAC = jac.incrementAndGet();
+            int termCount = jobsInCurrentTerm.incrementAndGet();
+            inFlightJobs++;
+            if (termCount == MAX_JOBS_PER_TERM) {
+                termClosing = true;
+            }
+            admission = new JobAdmission(coordinatorTermSequence, newJAC, termCount);
+        }
+
+        System.out.println("[Coordinator " + workerId + "] job admitted -> JAC="
+                + admission.jac() + " termCount=" + admission.termCount()
+                + "/" + MAX_JOBS_PER_TERM);
+        if (admission.termCount() == MAX_JOBS_PER_TERM) {
+            System.out.println("[Coordinator " + workerId
+                    + "] term closed after fifth admission; waiting for admitted jobs to finish");
+        }
+        return admission;
+    }
+
+    private void completeTopLevelJob(JobAdmission admission) {
+        boolean startReelection = false;
+        synchronized (termStateLock) {
+            if (admission.termSequence() != coordinatorTermSequence) {
+                return;
+            }
+
+            if (inFlightJobs > 0) {
+                inFlightJobs--;
+            }
+            if (inFlightJobs == 0 && termClosing
+                    && !termTransitionStarted && isCoordinator) {
+                termTransitionStarted = true;
+                isCoordinator = false;
+                coordinatorId = -1;
+                coordinatorRef = null;
+                jobsInCurrentTerm.set(0);
+                startReelection = true;
+            }
+        }
+
+        if (startReelection) {
+            System.out.println("[Coordinator " + workerId
+                    + "] all admitted jobs finished; initiating one new election");
+            try {
+                initiateElection();
+            } catch (RemoteException e) {
+                System.err.println("[Coordinator " + workerId
+                        + "] term-transition election failed: " + e.getMessage());
+            }
+        }
+    }
+
+    private record JobAdmission(long termSequence, int jac, int termCount) {
+    }
+
+    private List<WorkerInterface> usableWorkersInIdOrder() throws RemoteException {
+        List<WorkerInterface> discovered = discoverActiveWorkers();
+        if (discovered == null) {
+            throw new RemoteException("Active-worker discovery returned no snapshot");
+        }
+
+        TreeMap<Integer, WorkerInterface> workersById = new TreeMap<>();
+        for (WorkerInterface worker : discovered) {
+            if (worker == null) {
+                continue;
+            }
+            try {
+                workersById.putIfAbsent(worker.getWorkerId(), worker);
+            } catch (RemoteException e) {
+                System.err.println("[Coordinator " + workerId
+                        + "] skipping unreachable worker: " + e.getMessage());
+            }
+        }
+        return List.copyOf(workersById.values());
+    }
+
+    /**
+     * Resolves the Bootstrap membership snapshot. Protected visibility permits
+     * deterministic test-mode membership without creating a second production
+     * membership mechanism.
+     */
+    protected List<WorkerInterface> discoverActiveWorkers() throws RemoteException {
+        if (bootstrap == null) {
+            throw new RemoteException("Bootstrap membership is unavailable");
+        }
+
+        List<String> activeAddresses = bootstrap.getActiveWorkers();
+        List<WorkerInterface> resolved = new ArrayList<>(activeAddresses.size());
+        for (String address : activeAddresses) {
+            if (rmiAddress.equals(address)) {
+                resolved.add(this);
+                continue;
+            }
+            try {
+                resolved.add((WorkerInterface) Naming.lookup(address));
+            } catch (Exception e) {
+                System.err.println("[Coordinator " + workerId + "] could not resolve "
+                        + address + ": " + e.getMessage());
+            }
+        }
+        return resolved;
+    }
+
+    private static void cancelDispatches(List<Future<WorkResult>> futures) {
+        for (Future<WorkResult> future : futures) {
+            future.cancel(true);
+        }
+    }
+
+    void shutdownComputeExecutor() {
+        shutdownExecutor(computeExecutor);
+    }
+
+    void shutdownWorkerExecutors() {
+        shutdownExecutor(dispatchExecutor);
+        shutdownComputeExecutor();
+    }
+
+    private static void shutdownExecutor(ExecutorService executor) {
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(
+                    COMPUTE_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    boolean isComputeExecutorShutdown() {
+        return computeExecutor.isShutdown();
+    }
+
+    boolean isDispatchExecutorShutdown() {
+        return dispatchExecutor.isShutdown();
     }
 
     @Override
@@ -271,12 +597,8 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         System.out.println("[Worker " + workerId + "] COORDINATOR " + coordinatorMessageId + " -> " + coordId + " via " + senderInfo);
 
         // Update local view – eventually all reachable workers agree on single coordinator
-        this.coordinatorId = coordId;
-        this.coordinatorRef = coordRef;
-        boolean wasCoordinator = this.isCoordinator;
-        this.isCoordinator = (coordId == this.workerId);
+        boolean wasCoordinator = installCoordinatorState(coordId, coordRef);
         if (this.isCoordinator) {
-            jobsInCurrentTerm.set(0);
             if (!wasCoordinator) System.out.println("[Worker " + workerId + "] *** BECAME COORDINATOR *** term " + coordinatorMessageId);
         } else {
             if (wasCoordinator) System.out.println("[Worker " + workerId + "] stepped down, new coordinator=" + coordId);
@@ -307,9 +629,15 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
                     }
                 } catch (RemoteException e) {
                     System.out.println("[Worker " + workerId + "] coordinator " + coordinatorId + " unreachable, proceeding with election");
-                    coordinatorId = -1;
-                    coordinatorRef = null;
-                    isCoordinator = false;
+                    synchronized (termStateLock) {
+                        coordinatorId = -1;
+                        coordinatorRef = null;
+                        isCoordinator = false;
+                        coordinatorTermSequence++;
+                        inFlightJobs = 0;
+                        termClosing = false;
+                        termTransitionStarted = false;
+                    }
                 }
             }
 
@@ -346,12 +674,8 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
 
             System.out.println("[Worker " + workerId + "] election result: winner=" + best + " (JAC=" + best.jac + ")");
             // Update self before broadcasting (so self is consistent)
-            this.coordinatorId = electedId;
-            this.coordinatorRef = electedRef;
-            boolean wasCoord = this.isCoordinator;
-            this.isCoordinator = (electedId == workerId);
+            boolean wasCoord = installCoordinatorState(electedId, electedRef);
             if (this.isCoordinator) {
-                jobsInCurrentTerm.set(0);
                 if (!wasCoord) System.out.println("[Worker " + workerId + "] *** ELECTED AS COORDINATOR ***");
             }
 
@@ -368,6 +692,23 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         }
     }
 
+    private boolean installCoordinatorState(int electedId, WorkerInterface electedRef) {
+        synchronized (termStateLock) {
+            boolean wasCoordinator = isCoordinator;
+            coordinatorId = electedId;
+            coordinatorRef = electedRef;
+            isCoordinator = (electedId == workerId);
+            coordinatorTermSequence++;
+            inFlightJobs = 0;
+            termClosing = false;
+            termTransitionStarted = false;
+            if (isCoordinator) {
+                jobsInCurrentTerm.set(0);
+            }
+            return wasCoordinator;
+        }
+    }
+
     // ---- JAC & Term limits (5 jobs per term) ----
 
     @Override
@@ -376,34 +717,13 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
     }
 
     @Override
-    public synchronized int recordJobAssignment() throws RemoteException {
-        if (!isCoordinator) {
-            throw new RemoteException("Worker " + workerId + " is not coordinator – cannot assign jobs");
+    public int recordJobAssignment() throws RemoteException {
+        JobAdmission admission = admitTopLevelJob();
+        try {
+            return admission.jac();
+        } finally {
+            completeTopLevelJob(admission);
         }
-        int newJAC = jac.incrementAndGet();
-        int termCount = jobsInCurrentTerm.incrementAndGet();
-        System.out.println("[Coordinator " + workerId + "] job assigned -> JAC=" + newJAC + " termCount=" + termCount + "/5");
-
-        if (termCount >= 5) {
-            System.out.println("[Coordinator " + workerId + "] TERM LIMIT REACHED (5 jobs) – ending term, triggering re-election");
-            // End term asynchronously so caller's job thread is not blocked inside RMI
-            new Thread(() -> {
-                try {
-                    Thread.sleep(400);
-                    synchronized (electionLock) {
-                        isCoordinator = false;
-                        coordinatorId = -1;
-                        coordinatorRef = null;
-                        jobsInCurrentTerm.set(0);
-                    }
-                    System.out.println("[Coordinator " + workerId + "] term ended, initiating new election");
-                    initiateElection();
-                } catch (Exception e) {
-                    System.err.println("[Coordinator " + workerId + "] re-election after term failed: " + e.getMessage());
-                }
-            }, "term-end-" + workerId).start();
-        }
-        return newJAC;
     }
 
     /**
