@@ -299,14 +299,14 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
     }
 
     private long forwardJobToCoordinator(JobRequest request) throws RemoteException {
+        // Election on demand: only when work is submitted and no live coordinator
+        // exists, flood an election across all reachable workers first.
+        if (!isLiveCoordinator(coordinatorRef)) {
+            initiateElection();
+        }
         WorkerInterface target = coordinatorRef;
         if (target == null) {
-            // No coordinator active: any worker may initiate an election (automated).
-            initiateElection();
-            target = coordinatorRef;
-            if (target == null) {
-                throw new RemoteException("Worker " + workerId + " has no known coordinator");
-            }
+            throw new RemoteException("Worker " + workerId + " has no known coordinator");
         }
 
         try {
@@ -317,6 +317,17 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
             return target.submitJob(request);
         } catch (RemoteException e) {
             throw new RemoteException("Unable to forward job to coordinator", e);
+        }
+    }
+
+    private boolean isLiveCoordinator(WorkerInterface target) {
+        if (target == null) {
+            return false;
+        }
+        try {
+            return target.getWorkerId() != workerId && target.isCoordinator();
+        } catch (RemoteException e) {
+            return false;
         }
     }
 
@@ -742,20 +753,10 @@ public class WorkerNode extends UnicastRemoteObject implements WorkerInterface {
         int port = args.length > 2 ? Integer.parseInt(args[2]) : 1099;
         try {
             WorkerNode node = new WorkerNode(id, host, port);
-            System.out.println("[Worker " + id + "] ready. JAC=" + node.jac.get());
-            // Automated election: if no coordinator is active, this worker initiates one.
-            // Delayed so neighbours have time to join the unstructured network.
-            Thread electionTrigger = new Thread(() -> {
-                try {
-                    Thread.sleep(2000);
-                    node.initiateElection();
-                } catch (Exception e) {
-                    System.err.println("[Worker " + id + "] automatic election failed: " + e.getMessage());
-                }
-            }, "worker-" + id + "-auto-elect");
-            electionTrigger.setDaemon(true);
-            electionTrigger.start();
+            System.out.println("[Worker " + id + "] ready. JAC=" + node.jac.get()
+                    + ". Election runs on first job submission.");
             // Stay alive for RMI callbacks without requiring terminal input.
+            // No election here: the first submitJob triggers one across all workers.
             Thread.currentThread().join();
         } catch (Exception e) {
             e.printStackTrace();
