@@ -81,7 +81,7 @@ mvn test
 
 ## Authors
 
-Vishant Kumar: S11230430
-Anav Chand: S11221203
-James Kado: S11200776
-Rohan Nandan: S11234883
+- Vishant Kumar: S11230430
+- Anav Chand: S11221203
+- James Kado: S11200776
+- Rohan Nandan: S11234883
