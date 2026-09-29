@@ -3,11 +3,9 @@ package com.cs324a1.common;
 import java.io.Serializable;
 
 /**
- * Election candidate representing a worker's candidacy.
  * Comparable logic: lowest JAC wins; tie -> highest ID wins.
- * Member 2 deliverable – JAC tracking.
  *
- * @author Member 2
+ * @author Rohan Nandan - S11234883
  */
 public class Candidate implements Serializable {
     private static final long serialVersionUID = 1L;
